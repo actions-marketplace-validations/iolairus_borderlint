@@ -123,8 +123,54 @@ allow-list, mirroring the residency `local` exemption.
 compelled-disclosure exposure; it does **not** decide whether a given statute legally applies to
 any specific flow — that depends on the provider's corporate structure, the data classes, and the
 operator's own jurisdiction. borderlint surfaces the bloc; the policy decides. Open-weights
-provenance (export-control / supply-chain risk for downloaded weights) is a distinct concern and
-is explicitly out of scope for this dimension.
+provenance is covered by the separate provenance dimension (§3.2).
+
+### 3.2 Provenance — whose model weights, orthogonal to both
+
+**Provenance** answers a third question: **whose model weights does this flow run** — the bloc of
+the legal regime under which the model's *developer* operates. The three axes genuinely decouple:
+a flow to Bedrock `ap-east-1` serving DeepSeek-R1 is residency `hk`, sovereignty `us`, provenance
+`cn`; a self-hosted Qwen via Ollama is residency and sovereignty `local` with the same `cn`
+provenance.
+
+**Resolution is two-tier.** A **model reference** found statically in code (a managed-platform
+model ID like `anthropic.claude-…`, a bare API name like `gpt-4o` / `qwen2.5-72b`, an
+aggregator-qualified ID like `deepseek/deepseek-r1`, or a hub repo ID like `Qwen/…`) resolves via
+the bundled provenance map — matched case-insensitively by anchored prefix, longest prefix wins.
+Absent a model reference, a provider that serves **only its own models** (OpenAI, Anthropic,
+DeepSeek, Mistral, Zhipu, …) resolves to that org's bloc; multi-model hosts (Bedrock, Vertex) and
+aggregators resolve to `unknown`. A model reference binds to a provider flow **in the same file**;
+with no provider in its file it stands alone as a `model_reference` finding — a weights-origin
+signal, not a network flow (never residency-evaluated). Aggregator-qualified IDs make provenance
+the one axis routers don't obscure: `deepseek/deepseek-r1` via OpenRouter resolves provenance `cn`
+while residency and sovereignty stay `unknown`.
+
+**Local LLM usage resolves too.** Redistributor-qualified IDs from the GGUF/MLX ecosystem
+(`mlx-community/Qwen2.5-7B-Instruct-4bit`, `TheBloke/Llama-2-7B-GGUF`, `bartowski/…`,
+`unsloth/…`) resolve by the model family in the repo name — the quantizer org is stripped, since
+packaging carries no provenance. `.gguf` file paths match by basename
+(`models/qwen2.5-7b-q4_k_m.gguf` → `cn`), and bare local-runtime tags (`llama3.2`, `phi4`,
+`gemma2:9b`, `qwq:32b`) are covered by pinned family prefixes; tool names that merely resemble a
+family (`llama_index`, `llama-cpp-python`) never match. Combined with Ollama's `local`
+residency/sovereignty, self-hosted flows carry an honest weights origin: `local`/`local`/`cn`
+for a local Qwen, `local`/`local`/`us` for a local Llama.
+
+**Blocs** reuse the sovereignty vocabulary minus `local` (weights always have a developer):
+`us`, `eu`, `cn`, `uk`, `ru`, `in`, `il`, `ca`, `unknown`. Fine-tunes and distillations inherit
+the base family's bloc.
+
+**Opt-in policy block**, same shape and ergonomics as sovereignty:
+
+```json
+"provenance": {
+  "on_unknown": "warn",
+  "classifications": { "customer-pii": ["us", "eu"] }
+}
+```
+
+Absent the block, behaviour is unchanged (provenance is reported but never gates). `fail_on`
+accepts `provenance`; the default excludes it. `on_unknown: "fail"` gates on its own. The map is
+advisory: it surfaces weight origin, never adjudicates export-control applicability.
 
 ## 4. Policy & execution model
 
@@ -206,6 +252,8 @@ MVP and most of P2 have shipped; the remaining work is re-tiered into next/later
 | C8 | Residency targets may be **discrete entities or zones** (e.g. `allow: [HK, GBA]`) | ✅ |
 | C9 | Surface **relevant arrangement reference links** for a flagged flow as *context* — e.g. **GBA Standard Contract**; reference only, not enforced (applicability depends on the user's home jurisdiction & data scope) | ✅ |
 | C10 | Declare **home base / regime** — HK·PDPO or GBA/Mainland·PIPL — so defaults & surfaced references adapt | ✅ |
+| C11 | **Sovereignty** dimension (§3.1): per-classification allow-lists of compelled-disclosure blocs, opt-in | ✅ |
+| C12 | **Provenance** dimension (§3.2): per-classification allow-lists of model-weights blocs, opt-in | ✅ |
 
 ### D. Reporting & output
 | # | Capability | Status |

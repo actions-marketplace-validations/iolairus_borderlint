@@ -104,6 +104,30 @@ def _is_loopback_evidence(evidence: str) -> bool:
     return any(h in low for h in _LOOPBACK_HOSTS) or ".localhost" in low
 
 
+# --- Provenance dimension -----------------------------------------------------
+# Provenance blocs: the legal regime of the model's developer (whose weights), derived from model
+# references found statically in code. The sovereignty vocabulary minus `local` — weights always
+# have a developer. Distinct from residency and sovereignty.
+_PROVENANCE_BLOCS = frozenset({"us", "eu", "cn", "uk", "ru", "in", "il", "ca", "unknown"})
+
+# A model identifier: no spaces, model-id punctuation only. Anchors prefix matching so prose
+# strings that merely start with a model name ("gpt-4 is great") are never flagged.
+_MODEL_ID = re.compile(r"^[A-Za-z0-9._/:-]{3,100}$")
+
+# ponytail: tool names that resemble a model-family prefix; a stoplist beats a veto mechanism
+_NOT_MODELS = ("llama_index", "llama-index", "llamaindex", "llama_cpp", "llama-cpp", "llamafile")
+
+
+def _valid_provenance(token: str) -> bool:
+    """A provenance bloc must be one of the fixed vocabulary."""
+    return token in _PROVENANCE_BLOCS
+
+
+def _load_provenance_map() -> dict:
+    """Bundled model-ID prefix → bloc map + first-party provider defaults (advisory)."""
+    return json.loads(files("borderlint").joinpath("data/provenance.json").read_text("utf-8"))
+
+
 def _endpoints_provider(endpoints: dict) -> dict:
     for host, juris in endpoints.items():
         if not _valid_jurisdiction(juris):
@@ -121,6 +145,9 @@ def load_kb(path: str | None = None) -> "KB":
     providers = list(bundled.get("providers", []))
     sov_doc = _load_sovereignty_map()
     sov_map = dict(sov_doc.get("providers", {}))  # bundled provider id → bloc (copy; user merges in)
+    prov_doc = _load_provenance_map()
+    prov_patterns = {pat.lower(): entry["bloc"] for pat, entry in prov_doc.get("patterns", {}).items()}
+    user_prov_patterns: dict = {}
     if path:
         with open(path, encoding="utf-8") as fh:
             user = json.load(fh)
@@ -138,10 +165,25 @@ def load_kb(path: str | None = None) -> "KB":
                         f"invalid sovereignty bloc '{bloc}' for provider '{pid}' "
                         "(use one of us, eu, cn, uk, ru, in, il, ca, local, unknown)")
                 sov_map[pid] = bloc  # user wins
+        # User provenance overrides: a top-level "provenance" map (model-ID prefix → bloc) takes
+        # precedence over the bundled patterns — even shorter user prefixes beat longer bundled
+        # ones, mirroring the provider KB; validated against the bloc vocabulary.
+        user_prov = user.get("provenance", {})
+        if isinstance(user_prov, dict):
+            for pat, bloc in user_prov.items():
+                if not _valid_provenance(bloc):
+                    raise ValueError(
+                        f"invalid provenance bloc '{bloc}' for model pattern '{pat}' "
+                        "(use one of us, eu, cn, uk, ru, in, il, ca, unknown)")
+                user_prov_patterns[pat.lower()] = bloc
     kb = KB(providers)
     kb.updated = bundled.get("updated")
     kb.sovereignty_map = sov_map
     kb.sovereignty_updated = sov_doc.get("updated")
+    kb.provenance_defaults = dict(prov_doc.get("provider_defaults", {}))
+    kb.provenance_passthrough = [o.lower() for o in prov_doc.get("passthrough_orgs", [])]
+    kb.provenance_updated = prov_doc.get("updated")
+    kb.set_provenance_patterns(prov_patterns, user_prov_patterns)
     return kb
 
 
@@ -168,6 +210,21 @@ class KB:
         self.updated: str | None = None  # KB last-reviewed date, set by load_kb
         self.sovereignty_map: dict = {}  # provider id → sovereignty bloc, set by load_kb
         self.sovereignty_updated: str | None = None  # sovereignty map last-reviewed date
+        self.provenance_defaults: dict = {}  # provider id → bloc for first-party-only providers
+        self.provenance_passthrough: list = []  # quantizer/community org prefixes, stripped before match
+        self.provenance_updated: str | None = None  # provenance map last-reviewed date
+        self._prov_prefixes: list = []  # (prefix, bloc), longest first, set via set_provenance_patterns
+
+    def set_provenance_patterns(self, patterns: dict, user_patterns: dict | None = None) -> None:
+        """Install the model-ID prefix → bloc maps.
+
+        User patterns take precedence over bundled ones — even a shorter user prefix beats a
+        longer bundled prefix, mirroring the provider KB. Within a source, longest prefix wins.
+        """
+        user = user_patterns or {}
+        items = [(0, p, b) for p, b in user.items()] + \
+                [(1, p, b) for p, b in patterns.items() if p not in user]
+        self._prov_prefixes = [(p, b) for _, p, b in sorted(items, key=lambda x: (x[0], -len(x[1])))]
 
     def name(self, pid: str) -> str:
         return self.by_id.get(pid, {}).get("name", pid)
@@ -200,6 +257,35 @@ class KB:
         if jurisdiction and jurisdiction in overrides:
             return overrides[jurisdiction]
         return self.default_sovereignty(provider_id)
+
+    def match_model(self, literal: str) -> tuple[str, str] | None:
+        """Match a string literal against the model-ID prefix map → (identifier, bloc) or None.
+
+        Anchored: the whole literal must look like a model identifier (no spaces, model-id
+        charset) and start with a known prefix. Longest prefix wins. Local-model forms (D7):
+        a `.gguf` path matches by basename; a redistributor org (quantizer/community hub) is
+        stripped so the model family in the repo name carries the provenance.
+        """
+        s = literal.strip()
+        if not _MODEL_ID.match(s):
+            return None
+        low = s.lower()
+        if low.endswith(".gguf"):  # model-file path: directories defeat start-anchoring
+            low = low.rsplit("/", 1)[-1]
+        for org in self.provenance_passthrough:  # quantizer hubs carry no provenance
+            if low.startswith(org):
+                low = low[len(org):]
+                break
+        if low.startswith(_NOT_MODELS):
+            return None
+        for prefix, bloc in self._prov_prefixes:
+            if low.startswith(prefix):
+                return s, bloc
+        return None
+
+    def default_provenance(self, pid: str) -> str:
+        """Tier-2 provenance: the org's bloc for providers that serve only their own models."""
+        return self.provenance_defaults.get(pid, "unknown")
 
     def category(self, pid: str) -> str:
         """Provider category: 'inference' (default), 'vector_store', or 'aggregator'."""
